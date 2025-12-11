@@ -10,6 +10,8 @@
 from estimater import *
 from datareader import *
 import onnxruntime as ort
+import pandas as pd
+import time
 from omegaconf import OmegaConf
 
 # ==============================================================================
@@ -198,7 +200,7 @@ if __name__=='__main__':
   # logging.info("estimator initialization done")
   # print_gpu_memory_info("After initializing estimator")
 
-#     # --- 1. 初始化 PyTorch 版本 (Baseline) ---
+#   # --- 1. 初始化 PyTorch 版本 (Baseline) ---
 #   print("Initializing PyTorch Estimator...")
 #   scorer_pt = ScorePredictor()
 #   refiner_pt = PoseRefinePredictor()
@@ -222,24 +224,77 @@ if __name__=='__main__':
   # 初始化数据读取器，读取测试场景数据
   reader = YcbineoatReader(video_dir=test_scene_dir, shorter_side=None, zfar=np.inf)
 
+  # ==============================================================================
+  # Warmup
+  # ==============================================================================
+  print("\n=== Performing Full Pipeline Warmup ===")
+  dummy_color = np.zeros((480, 640, 3), dtype=np.uint8) # 假设 VGA 分辨率，或者用 reader.get_color(0).shape
+  dummy_depth = np.ones((480, 640), dtype=np.float32) # 深度设为 1米，避免全0导致除以0错误
+  dummy_mask = np.ones((480, 640), dtype=bool) # 全掩码
+  dummy_K = reader.K # 使用真实的相机内参
+
+  # 2. 预热 Register 流程
+  print("Warming up Register pipeline...")
+  for _ in range(5):
+      try:
+          est_onnx.register(K=dummy_K, rgb=dummy_color, depth=dummy_depth, ob_mask=dummy_mask, iteration=2)
+      except Exception as e:
+          pass # 忽略预热时的数学错误
+
+  print("Warming up Track pipeline...")
+  est_onnx.pose_last = np.eye(4) 
+  for _ in range(5):
+      try:
+          est_onnx.track_one(rgb=dummy_color, depth=dummy_depth, K=dummy_K, iteration=2)
+      except Exception as e:
+          pass
+
+  torch.cuda.synchronize()
+  print("=== Warmup Complete ===\n")
+  # ==============================================================================
+
   print(f"\n{'='*90}")
   print(f"{'Frame':<5} | {'Trans Err (cm)':<15} | {'Rot Err (deg)':<15} | {'Status':<10}")
   print(f"{'='*90}")
-
+  
+  results = [] # 用于存储每一帧的测试结果
+  
   # 遍历所有帧，进行姿态估算和跟踪
   # print_gpu_memory_info("Before processing frames")
   for i in range(len(reader.color_files)):
     logging.info(f'i:{i}')
     color = reader.get_color(i)
     depth = reader.get_depth(i)
+    # 变量初始化
+    pose_pt = None
+    pose_onnx = None
+    
+    # 统计数据容器
+    frame_stats = {'frame': i}
     if i==0:
       # 第一帧：使用mask进行姿态注册（初始估算）
       mask = reader.get_mask(0).astype(bool)
       # pose = est.register(K=reader.K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
     #   # PyTorch 推理
+    #   torch.cuda.reset_peak_memory_stats() # 重置显存统计
+    #   torch.cuda.synchronize()
+    #   start_t = time.time()
     #   pose_pt = est_pt.register(K=reader.K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+      
+    #   torch.cuda.synchronize()
+    #   end_t = time.time()
+    #   frame_stats['pth_time_sec'] = end_t - start_t
+    #   frame_stats['pth_mem_MB'] = torch.cuda.max_memory_allocated() / (1024**2)
+      
       # ONNX 推理
+      torch.cuda.reset_peak_memory_stats()
+      torch.cuda.synchronize()
+      start_t = time.time()
       pose_onnx = est_onnx.register(K=reader.K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+      torch.cuda.synchronize()
+      end_t = time.time()
+      frame_stats['onnx_time_sec'] = end_t - start_t
+      frame_stats['onnx_mem_MB'] = torch.cuda.max_memory_allocated() / (1024**2)
 
       if debug>=3:
         # debug等级高时，保存mesh变换结果和点云
@@ -254,14 +309,37 @@ if __name__=='__main__':
       # 后续帧：使用跟踪器进行姿态跟踪
       # pose = est.track_one(rgb=color, depth=depth, K=reader.K, iteration=track_refine_iter)
     #   # PyTorch 推理
+    #   torch.cuda.reset_peak_memory_stats()
+    #   torch.cuda.synchronize()
+    #   start_t = time.time()
     #   pose_pt = est_pt.track_one(rgb=color, depth=depth, K=reader.K, iteration=track_refine_iter)
+    #   torch.cuda.synchronize()
+    #   end_t = time.time()
+    #   frame_stats['pth_time_sec'] = end_t - start_t
+    #   frame_stats['pth_mem_MB'] = torch.cuda.max_memory_allocated() / (1024**2)
       # ONNX 推理
+      torch.cuda.reset_peak_memory_stats()
+      torch.cuda.synchronize()
+      start_t = time.time()
       pose_onnx = est_onnx.track_one(rgb=color, depth=depth, K=reader.K, iteration=track_refine_iter)
 
     # --- 计算并打印误差 ---
     # t_err, r_err = compute_pose_error(pose_pt, pose_onnx)
     # status = "OK" if t_err < 0.1 and r_err < 0.1 else "DIFF"
     # print(f"{i:<5} | {t_err:<15.6f} | {r_err:<15.6f} | {status:<10}")
+    torch.cuda.synchronize()
+    end_t = time.time()
+    frame_stats['onnx_time_sec'] = end_t - start_t
+    frame_stats['onnx_mem_MB'] = torch.cuda.max_memory_allocated() / (1024**2)
+
+    # --- 计算误差 ---
+    # t_err, r_err = compute_pose_error(pose_pt, pose_onnx)
+    
+    # 记录精度数据
+    # frame_stats['trans_err_cm'] = t_err
+    # frame_stats['rot_err_deg'] = r_err
+    # 将本帧数据加入列表
+    results.append(frame_stats)
 
     # 姿态结果保存为txt文件
     os.makedirs(f'{debug_dir}/ob_in_cam', exist_ok=True)
@@ -282,3 +360,20 @@ if __name__=='__main__':
       os.makedirs(f'{debug_dir}/track_vis', exist_ok=True)
       imageio.imwrite(f'{debug_dir}/track_vis/{reader.id_strs[i]}.png', vis)
   # print_gpu_memory_info("At the end of processing")
+
+  # --- 循环结束后，保存 Excel ---
+  print(f"\n正在保存对比结果...")
+  df = pd.DataFrame(results)
+  
+  # 计算平均值并添加到底部
+  mean_row = df.mean(numeric_only=True)
+  mean_row['frame'] = 'Average'
+  df = pd.concat([df, pd.DataFrame([mean_row])], ignore_index=True)
+  
+  excel_path = f'{debug_dir}/compare_results.xlsx'
+  df.to_excel(excel_path, index=False)
+  print(f"✅ 成功保存 Excel 文件: {excel_path}")
+#   print(f"平均 PyTorch 时间: {mean_row['pth_time_sec']:.4f}s")
+  print(f"平均 ONNX 时间:    {mean_row['onnx_time_sec']:.4f}s")
+#   print(f"平均平移误差:      {mean_row['trans_err_cm']:.6f} cm")
+#   print(f"平均旋转误差:      {mean_row['rot_err_deg']:.6f} deg")
